@@ -1,0 +1,3 @@
+- [ ] PPID spoofing - the rest of the heuristics 
+- [ ] Leverage as a bof?
+- [ ] `NtQuerySystemInformation` - tons of information gathering / anti-analysis opens needs to be checked
