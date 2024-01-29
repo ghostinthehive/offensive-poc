@@ -1,2 +1,3 @@
 - [ ] poc-bof - native process hollowing
-- [ ] smokeloader-poc - smokeloader implementation 
+- [ ] smokeloader-poc - smokeloader implementation
+- [ ] noob-obf - a simple base line for an obfuscator
